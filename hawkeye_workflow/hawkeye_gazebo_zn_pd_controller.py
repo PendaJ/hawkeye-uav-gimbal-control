@@ -1,0 +1,662 @@
+# Conventional ZN-PD baseline for Gazebo Harmonic / ROS 2 Humble.
+# GENERATED FROM the uploaded original SS-PD controller; original untouched.
+# DO NOT present this as ZN-SSPD: no state observer is used in tracking.
+# Critical: matches the existing 0.2 rad/s output clamp and legacy optics.
+
+###################
+#  controller.py  # 
+###################
+#
+# State-Space PD (SS-PD) gimbal controller.
+# Gazebo / ROS 2 Humble adaptation of the user-supplied Isaac Sim controller.
+# Integration safety: motion is OFF by default; /cam_vel_preview displays
+# calculated commands. For finite experiments set enable_motion:=true and
+# run_seconds:=3.0; the node publishes repeated ZERO rates before exit.
+# NPSO gains/observer equations are otherwise preserved; the pitch output sign
+# is inverted only in TRACKING mode to match measured Gazebo joint directions.
+# Camera optical constants are still from Isaac Sim, NOT yet calibrated to the
+# Gazebo model; do not use trial results for manuscript comparisons.
+
+#
+# NAMING NOTE
+# -----------
+# The ROS 2 package (`sspid2`), this class (`SSPID`) and the `/pid_log` topic
+# keep the historical "PID" name so that previously recorded bags and result
+# files remain readable. The control law reported in the paper is a *PD* law:
+# ki is 0.0 in every experiment. The integral channel of the observer is kept
+# only for backwards compatibility and is NOT validated (see SSPID below); the
+# node warns at start-up if ki != 0.
+
+# Standard ROS 2 and numerical imports
+import rclpy, math, time
+import numpy as np
+from rclpy.node import Node
+from geometry_msgs.msg import Point, Twist, Vector3
+from std_msgs.msg import Float64MultiArray, String
+
+# ============================================================================
+#  ACTIVE GAIN SET
+# ----------------------------------------------------------------------------
+#  These are only the *defaults*; every gain can be overridden with ROS 2
+#  parameters (see README). Swap this block with one of the alternatives below
+#  to reproduce a specific experiment.
+#
+#  Values below are Table 3 of the paper (NPSO-tuned parameters and fitness
+#  weights for Experiments 2-7), with w = [w_MAE, w_vol, w_acc, w_zc].
+#
+#  DISCREPANCY TO RESOLVE: for Experiments 6 and 7 the working tree carried
+#  Kp = 8.63482313 / Kd = 0.15000789 and Kp = 10.23482313 / Kd = 0.12000789 /
+#  omega_o = 818.29943956, which differ from Table 3 beyond rounding. The
+#  published table is used here; check the original NPSO reports and correct
+#  whichever source is wrong. Experiments 2-5 matched the table exactly.
+# ============================================================================
+
+# >>> Exp. 6 - Combined, equal weights   w = [1, 1, 1, 1]
+kp      = 9.6348
+ki      = 0.0
+kd      = 0.1508
+omega_o = 600.2994
+
+# ---- Alternative gain sets (paper Table 3) ---------------------------------
+#
+# # Debug / smoke-test only (NOT a paper result)
+# kp = 1.0;        ki = 0.0;  kd = 0.1;      omega_o = 100.0
+#
+# # Exp. 1 baseline - Ziegler-Nichols (Sec. 6.1). ZN-PD and ZN-SSPD share the
+# # same KP/KD; the SS realization additionally uses omega_o = 2N/Td with
+# # N = 20, giving approximately 632 rad/s.
+# kp = 7.68;       ki = 0.0;  kd = 0.48;     omega_o = 632.0
+#
+# # Exp. 2 - MAE only                    w = [1, 0,   0,   0]
+# kp = 13.2213;    ki = 0.0;  kd = 0.2255;   omega_o = 487.1265
+#
+# # Exp. 3 - MAE + Volatility            w = [1, 1,   0,   0]
+# kp = 12.3629;    ki = 0.0;  kd = 0.1225;   omega_o = 932.0433
+#
+# # Exp. 4 - MAE + Zero-crossings        w = [1, 0,   0,   1]
+# kp = 12.8675;    ki = 0.0;  kd = 0.1359;   omega_o = 956.2599
+#
+# # Exp. 5 - MAE + Acceleration          w = [1, 0,   1,   0]
+# #   (this set was previously labelled "MAE + Jerk"; per Eq. 24 the quantity
+# #    is the mean absolute SECOND difference of the radial error, i.e. an
+# #    acceleration-like term)
+# kp = 12.0321;    ki = 0.0;  kd = 0.1477;   omega_o = 901.5414
+#
+# # Exp. 7 - Combined, reweighted        w = [1, 0.5, 0.5, 1]
+# kp = 10.2877;    ki = 0.0;  kd = 0.1202;   omega_o = 818.4926
+# ----------------------------------------------------------------------------
+
+# ---- Configuration Parameters ----------------------------------------------
+# Camera and gimbal limits used to convert pixel error to angular error.
+#
+# NOTE: these must match the rendered image produced by the perception node
+# (`distance_to_center.py` resizes every frame to TARGET_WIDTH preserving the
+# aspect ratio). If you change the Isaac Sim camera resolution, change them
+# here as well -- the geometry is currently duplicated in two places.
+FRAME_WIDTH    = 640.0
+FRAME_HEIGHT   = 360.0
+FOCAL_LENGTH   = 18.1476   # mm, f in Eq. (6), USD `focalLength`
+HORIZ_APERTURE = 20.955    # mm, A_x in Sec. 3.4, USD `horizontalAperture`
+
+# A_y in Sec. 3.4. This is the USD *default* verticalAperture, and it is the
+# value used to produce every result in the paper, so it is kept as the default
+# in order to reproduce them.
+#
+# KNOWN ISSUE (see README, Known Limitations): 15.2908 mm describes a ~4:3
+# sensor, while the images are rendered at 640x360 (16:9). Isaac Sim derives
+# the vertical field of view from the aspect ratio, so the consistent value
+# would be A_y = A_x * H / W = 11.787 mm. With 15.2908 the vertical pixel pitch
+# s_y is ~30 % larger than s_x, which means the pitch axis receives a larger
+# angular error than the yaw axis for the same pixel offset, even though the
+# NPSO search assigns a single shared parameter vector to both axes (Eq. 11).
+# This is a plausible contributor to the yaw/pitch asymmetry visible in the
+# Scenario 2 traces. To use the geometrically consistent value instead:
+#   VERT_APERTURE = HORIZ_APERTURE * (FRAME_HEIGHT / FRAME_WIDTH)
+# Note that doing so invalidates a direct comparison with the published tables.
+VERT_APERTURE  = 15.2908
+
+CONTROL_PERIOD = 0.001   # s, nominal control period (dt used by the observer)
+MAX_VEL_TRACK  = 0.2     # rad/s
+MAX_VEL_STAB   = 0.2     # rad/s
+TARGET_TIMEOUT = 2.0     # time before confirming target loss
+STATUS_DECIMATION = 1000  # 1 Hz status to leave CPU time for YOLO (test mode)
+PREVIEW_DECIMATION = 20  # /cam_vel_preview at nominal 50 Hz
+TARGET_STALE_TIMEOUT = 0.6  # s, wall-clock safeguard: YOLO processes ~10 Hz
+ORIENTATION_STALE_TIMEOUT = 1.0  # s; stop if feedback disappears
+YAW_SOFT_LIMIT_DEG = 170.0
+PITCH_SOFT_LIMIT_DEG = 75.0
+STOP_HOLD_SECONDS = 0.60        # keep commanding zero to allow ROS/Gazebo delivery
+STOP_PUBLISH_INTERVAL = 0.02   # 50 Hz zero-rate commands during shutdown
+# -----------------------------------------------------------------------------
+
+
+class SSPID:
+    # State-space controller with an observer-based realization.
+    # It estimates the error, its derivative, and its integral.
+    #
+    # With ki = 0 (the configuration used in the paper) this is a pure SS-PD.
+    # The third observer state integrates the innovation (y - x_hat[1]), not
+    # the tracking error, so the integral channel does NOT behave like a
+    # classical I term. Do not enable ki without re-deriving the observer.
+    # ------------------------------------------------------------------
+    def __init__(self, kp: float, ki: float, kd: float,
+                 omega_o: float, dt: float = CONTROL_PERIOD):
+        self.kp = kp
+        self.ki = ki
+        self.kd = kd
+        self.dt = dt
+
+        # Observer bandwidth determines the observer coefficients.
+        # Forward-Euler stability of the double pole at -omega_o requires
+        # omega_o * dt < 2  (i.e. omega_o < 2000 rad/s at dt = 1 ms).
+        self.omega_o = omega_o
+        self.beta1 = omega_o ** 2   # Lo[0]
+        self.beta2 = 2.0 * omega_o  # Lo[1]
+
+        # Estimated state vector: [error_dot, error, integral_error]
+        self.x_hat = np.zeros(3)
+
+        # u[k-1] in Eq. (16) / Eq. (18): the control action produced on the
+        # previous sample by Eq. (20).
+        #
+        # By default this is the raw control-law output, exactly as the paper
+        # defines it. Calling set_applied_input() with the saturated command
+        # instead gives the observer the input the plant really received, which
+        # prevents the estimates from drifting while the rate command is
+        # saturated at MAX_VEL_TRACK. That is a deviation from Eq. (16) and is
+        # therefore opt-in (see the observer_uses_saturated_input parameter).
+        self.u_prev = 0.0
+
+        # Observer dynamics matrix
+        self._A_obs = np.array([
+            [0.0,     -self.beta1, 0.0],
+            [1.0,     -self.beta2, 0.0],
+            [0.0,     -1.0,        0.0]
+        ])
+        # Observer input vector
+        self._Be = np.array([1.0, 0.0, 0.0])
+        # Observer output injection vector
+        self._Lo = np.array([self.beta1, self.beta2, 1.0])
+
+    # ------------------------------------------------------------------
+    def reset(self):
+        # Reset the observer state to zero.
+        self.x_hat = np.zeros(3)
+        self.u_prev = 0.0
+
+    # ------------------------------------------------------------------
+    def compute(self, error: float) -> float:
+        # Measured output for the observer.
+        y = -error
+        # ---- Observer ----
+        # Euler integration of the observer dynamics, driven by the control
+        # action applied on the previous sample.
+        #
+        # FIX: this used to be `u_prev = +self._Ko_dot_xhat()`, i.e. the
+        # NEGATIVE of the control action that was actually applied, which made
+        # the observer's internal model inconsistent with the plant input.
+        x_hat_dot = (self._A_obs @ self.x_hat + self._Be * self.u_prev + self._Lo * y)
+        self.x_hat = self.x_hat + self.dt * x_hat_dot
+        # ---- Control law ----
+        # Control action is computed from the estimated states.
+        u = -self._Ko_dot_xhat()
+
+        # u[k] becomes u[k-1] for the next observer update (Eq. 16).
+        self.u_prev = u
+        return u
+
+    # ------------------------------------------------------------------
+    def set_applied_input(self, u_applied: float):
+        # Optional anti-windup: overwrite u[k-1] with the command that was
+        # really sent to the gimbal (after saturation). Deviates from Eq. (16).
+        self.u_prev = float(u_applied)
+
+    def _Ko_dot_xhat(self) -> float:  # multiplying Ko with x_hat
+        # Combine derivative, proportional, and integral gains.
+        return (self.kd * self.x_hat[0] + self.kp * self.x_hat[1] + self.ki * self.x_hat[2])
+
+
+class ConventionalPD:
+    """Classical PD on measured angular error, not on observer states.
+
+    Derivative updates only when a new /target_coord message is received. The
+    1 kHz controller loop holds the last derivative between YOLO measurements.
+    No observer or derivative filter is used. The existing gimbal output
+    saturation and physical sign calibration are retained by control_loop().
+    """
+    def __init__(self, kp, ki, kd, omega_o, dt=CONTROL_PERIOD):
+        if ki != 0:
+            raise ValueError('ConventionalPD is PD only: ki must be zero')
+        self.kp, self.ki, self.kd = float(kp), float(ki), float(kd)
+        self.omega_o = float(omega_o)  # Compatibility/status only; not used.
+        self.x_hat = np.zeros(3)       # Log compatibility: [d(error)/dt, error, 0]
+        self._previous_error = None
+        self._previous_stamp = None
+        self._derivative = 0.0
+
+    def reset(self):
+        self._previous_error = None
+        self._previous_stamp = None
+        self._derivative = 0.0
+        self.x_hat.fill(0.0)
+
+    def compute(self, error, sample_stamp=None):
+        error = float(error)
+        if not math.isfinite(error):
+            self.reset()
+            return 0.0
+        if sample_stamp is None:
+            raise ValueError('ConventionalPD requires the target measurement timestamp')
+        if self._previous_stamp != sample_stamp:
+            if self._previous_stamp is not None:
+                elapsed = sample_stamp - self._previous_stamp
+                if elapsed > 0.0:
+                    self._derivative = (error - self._previous_error) / elapsed
+            self._previous_error = error
+            self._previous_stamp = sample_stamp
+        self.x_hat[0] = self._derivative
+        self.x_hat[1] = error
+        return self.kp * error + self.kd * self._derivative
+
+    def set_applied_input(self, u_applied):
+        # No observer input channel in classical PD.
+        pass
+
+
+class GimbalControllerNode(Node):
+    def __init__(self):
+        super().__init__('gimbal_controller')
+
+        # Declare ROS 2 parameters for yaw and pitch gains.
+        self.declare_parameter('kp_yaw',            kp)
+        self.declare_parameter('ki_yaw',            ki)
+        self.declare_parameter('kd_yaw',            kd)
+        self.declare_parameter('omega_o_yaw',       omega_o)
+        self.declare_parameter('kp_pitch',          kp)
+        self.declare_parameter('ki_pitch',          ki)
+        self.declare_parameter('kd_pitch',          kd)
+        self.declare_parameter('omega_o_pitch',     omega_o)
+        # Opt-in anti-windup: feed the saturated command back into the
+        # observer. False reproduces Eq. (16) of the paper literally.
+        self.declare_parameter('observer_uses_saturated_input', False)
+        # Dry-run by default: calculate /cam_vel_preview but DO NOT actuate.
+        self.declare_parameter('enable_motion', False)
+        self.enable_motion = bool(self.get_parameter('enable_motion').value)
+        # In-process duration starts only after fresh target + orientation arrive.
+        # 0 disables automatic stopping (e.g. for preview/debugging).
+        self.declare_parameter('run_seconds', 0.0)
+        self.run_seconds = float(self.get_parameter('run_seconds').value)
+        if not math.isfinite(self.run_seconds) or self.run_seconds < 0.0:
+            raise ValueError('run_seconds must be finite and nonnegative')
+
+        # Read parameter values.
+        _kp_y   = self.get_parameter('kp_yaw').value
+        _ki_y   = self.get_parameter('ki_yaw').value
+        _kd_y   = self.get_parameter('kd_yaw').value
+        _oo_y   = self.get_parameter('omega_o_yaw').value
+        _kp_p   = self.get_parameter('kp_pitch').value
+        _ki_p   = self.get_parameter('ki_pitch').value
+        _kd_p   = self.get_parameter('kd_pitch').value
+        _oo_p   = self.get_parameter('omega_o_pitch').value
+        self.observer_uses_saturated_input = bool(
+            self.get_parameter('observer_uses_saturated_input').value)
+        if self.observer_uses_saturated_input:
+            self.get_logger().warn(
+                'observer_uses_saturated_input is enabled: the observer is driven '
+                'with the saturated command instead of u[k-1] as defined in Eq. (16). '
+                'Results will not be directly comparable with the published tables.'
+            )
+
+        # The published results use a PD law; warn loudly if that is not the case.
+        if _ki_y != 0.0 or _ki_p != 0.0:
+            self.get_logger().warn(
+                'ki != 0: the observer integral channel is NOT the classical I '
+                'term and has not been validated. The paper reports SS-PD (ki = 0).'
+            )
+        for name, value in (('omega_o_yaw', _oo_y), ('omega_o_pitch', _oo_p)):
+            if value * CONTROL_PERIOD >= 2.0:
+                self.get_logger().warn(
+                    f'{name} = {value:.1f} rad/s violates the forward-Euler '
+                    f'stability limit omega_o * dt < 2 at dt = {CONTROL_PERIOD} s.'
+                )
+
+        # Create SS-PID controllers for tracking mode.
+        self.sspid_yaw   = ConventionalPD(kp=_kp_y, ki=_ki_y, kd=_kd_y, omega_o=_oo_y)
+        self.sspid_pitch = ConventionalPD(kp=_kp_p, ki=_ki_p, kd=_kd_p, omega_o=_oo_p)
+
+        # Create softer SS-PID controllers for stabilization mode.
+        self.sspid_soft_yaw   = SSPID(kp=8.0, ki=0.0, kd=0.1, omega_o=10.0)
+        self.sspid_soft_pitch = SSPID(kp=8.0, ki=0.0, kd=0.1, omega_o=10.0)
+
+        # State variables.
+        self.error = [0.0, 0.0, 0.0]
+        self.current_orientation = [0.0, 0.0, 0.0]
+        self.target_orientation  = [0.0, 0.0, 0.0]
+        self.default_orientation = [0.0, 0.0, 0.0]
+        self.last_target_time = None
+        self.last_target_msg_mono = None
+        self.last_orientation_msg_mono = None
+        self._stale_stop_sent = False
+        self._preview_counter = 0
+        self._run_started_mono = None
+        self._stop_started_mono = None
+        self._last_stop_publish_mono = None
+        self.finished = False
+
+        # Subscribers.
+        self.create_subscription(Point,   '/target_coord',        self.target_callback,      10)
+        self.create_subscription(Vector3, '/current_orientation', self.orientation_callback, 10)
+
+        # Publishers.
+        self.publisher     = self.create_publisher(Twist,             '/cam_vel', 10)
+        self.preview_publisher = self.create_publisher(Twist, '/cam_vel_preview', 10)
+        self.log_publisher = self.create_publisher(Float64MultiArray, '/pid_log', 10)
+        self.logger_info   = self.create_publisher(String,            '/control', 10)
+
+        # Main control loop at 1 kHz.
+        self.create_timer(CONTROL_PERIOD, self.main_loop)
+        self._log_counter = 0
+
+        # Loop-period monitor: the observer assumes dt = CONTROL_PERIOD, so a
+        # systematic deviation invalidates the meaning of omega_o.
+        self._last_loop_time = None
+        self._period_acc = 0.0
+        self._period_n = 0
+        self.get_logger().warn(
+            'Gazebo conventional ZN-PD controller started. Motion enabled: '
+            f'{self.enable_motion}; run_seconds={self.run_seconds:.3f}. '
+            f'Gains: Kp={kp}, Kd={kd} (omega_o ignored in classical PD). '
+            'In TRACKING mode, output pitch and yaw signs are both negative '
+            'for positive image error. Camera optics need Gazebo calibration.')
+
+    # ------------------------------------------------------------------
+    def target_callback(self, msg):
+        # Pixel error and target-detection flag.
+        self.error[0] = msg.x
+        self.error[1] = msg.y
+        self.error[2] = msg.z
+        self.last_target_msg_mono = time.monotonic()
+
+    def orientation_callback(self, msg):
+        # Current gimbal orientation.
+        self.current_orientation[0] = msg.x
+        self.current_orientation[1] = msg.y
+        self.current_orientation[2] = msg.z
+        self.last_orientation_msg_mono = time.monotonic()
+
+    def pixel_to_angle(self, error_x, error_y):
+        # Convert pixel error to angular line-of-sight error.
+        pixel_size_x = HORIZ_APERTURE / FRAME_WIDTH
+        pixel_size_y = VERT_APERTURE  / FRAME_HEIGHT
+        sensor_error_x = error_x * pixel_size_x
+        sensor_error_y = error_y * pixel_size_y
+        angular_error_x_rad = np.arctan(sensor_error_x / FOCAL_LENGTH)
+        angular_error_y_rad = np.arctan(sensor_error_y / FOCAL_LENGTH)
+        return angular_error_x_rad, angular_error_y_rad
+
+    # ------------------------------------------------------------------
+    def _monitor_period(self):
+        now = time.perf_counter()
+        if self._last_loop_time is not None:
+            self._period_acc += now - self._last_loop_time
+            self._period_n += 1
+            if self._period_n >= 5000:
+                mean_dt = self._period_acc / self._period_n
+                if abs(mean_dt - CONTROL_PERIOD) > 0.2 * CONTROL_PERIOD:
+                    self.get_logger().warn(
+                        f'Measured control period {mean_dt * 1e3:.3f} ms deviates '
+                        f'from the nominal {CONTROL_PERIOD * 1e3:.3f} ms assumed by '
+                        f'the observer. omega_o is scaled accordingly.'
+                    )
+                self._period_acc = 0.0
+                self._period_n = 0
+        self._last_loop_time = now
+
+    # ------------------------------------------------------------------
+    def _send_command(self, msg: Twist):
+        # Bounds and joint soft stops are applied to PHYSICAL joint rates,
+        # not to the observer's raw output. The adapter clamps again at 0.2.
+        p = float(msg.angular.x)
+        y = float(msg.angular.y)
+        if not math.isfinite(p) or not math.isfinite(y):
+            self.get_logger().error('Nonfinite command: forcing zero rates.')
+            p = y = 0.0
+            self.sspid_pitch.reset()
+            self.sspid_yaw.reset()
+        p = max(-0.2, min(0.2, p))
+        y = max(-0.2, min(0.2, y))
+        pitch_deg, yaw_deg = self.current_orientation[0], self.current_orientation[2]
+        if (pitch_deg >= PITCH_SOFT_LIMIT_DEG and p > 0) or (pitch_deg <= -PITCH_SOFT_LIMIT_DEG and p < 0):
+            p = 0.0
+        if (yaw_deg >= YAW_SOFT_LIMIT_DEG and y > 0) or (yaw_deg <= -YAW_SOFT_LIMIT_DEG and y < 0):
+            y = 0.0
+        safe = Twist()
+        safe.angular.x = p
+        safe.angular.y = y
+        self._preview_counter += 1
+        if self._preview_counter % PREVIEW_DECIMATION == 0:
+            self.preview_publisher.publish(safe)
+        if self.enable_motion:
+            self.publisher.publish(safe)
+
+    # ------------------------------------------------------------------
+    def _publish_stop(self):
+        # Explicit zero rate to the adapter; do not depend on its 0.5 s deadman.
+        stop = Twist()
+        self.preview_publisher.publish(stop)
+        if self.enable_motion:
+            self.publisher.publish(stop)
+
+    def _begin_stop(self, now_mono):
+        self._stop_started_mono = now_mono
+        self._last_stop_publish_mono = now_mono
+        self._publish_stop()
+        elapsed = (now_mono - self._run_started_mono
+                   if self._run_started_mono is not None else 0.0)
+        self.get_logger().info(
+            f'Control duration {elapsed:.3f} s completed. '
+            f'Sending ZERO pitch/yaw for {STOP_HOLD_SECONDS:.2f} s.')
+
+    def _service_stop(self, now_mono):
+        # Once stopping has started, never issue another nonzero command.
+        if now_mono - self._last_stop_publish_mono >= STOP_PUBLISH_INTERVAL:
+            self._publish_stop()
+            self._last_stop_publish_mono = now_mono
+        if now_mono - self._stop_started_mono >= STOP_HOLD_SECONDS:
+            self.finished = True
+
+    # ------------------------------------------------------------------
+    def main_loop(self):
+        self._monitor_period()
+        now_mono = time.monotonic()
+        if self._stop_started_mono is not None:
+            self._service_stop(now_mono)
+            return
+        if (self.enable_motion and self.run_seconds > 0
+                and self._run_started_mono is not None
+                and now_mono - self._run_started_mono >= self.run_seconds):
+            self._begin_stop(now_mono)
+            return
+        data_stale = (
+            self.last_target_msg_mono is None
+            or self.last_orientation_msg_mono is None
+            or now_mono - self.last_target_msg_mono > TARGET_STALE_TIMEOUT
+            or now_mono - self.last_orientation_msg_mono > ORIENTATION_STALE_TIMEOUT
+        )
+        if data_stale:
+            if not self._stale_stop_sent:
+                self.sspid_yaw.reset()
+                self.sspid_pitch.reset()
+                self.sspid_soft_yaw.reset()
+                self.sspid_soft_pitch.reset()
+                self._send_command(Twist())
+                self._stale_stop_sent = True
+            return
+        self._stale_stop_sent = False
+        if (self.enable_motion and self.run_seconds > 0
+                and self._run_started_mono is None and self.error[2] != 0.0):
+            self._run_started_mono = now_mono
+            self.get_logger().info(
+                f'Fresh target and feedback acquired. Timed control '
+                f'window started: {self.run_seconds:.3f} s.')
+        # If no target is detected (flag = 0), run stabilization mode.
+        if abs(self.error[2]) == 0.0:   # No target detected
+            current_time = time.time()
+            if self.last_target_time is not None:
+                # After a timeout, return to the default orientation.
+                if (current_time - self.last_target_time) > TARGET_TIMEOUT:
+                    self.target_orientation = self.default_orientation.copy()
+                    self.last_target_time = None
+                    self.sspid_yaw.reset()
+                    self.sspid_pitch.reset()
+            self.stabilization_loop()
+        else:                           # Target detected
+            # Keep the last known orientation while the target is visible.
+            self.target_orientation[0] = self.current_orientation[0]
+            self.target_orientation[2] = self.current_orientation[2]
+            self.last_target_time = time.time()
+            self.sspid_soft_yaw.reset()
+            self.sspid_soft_pitch.reset()
+            self.control_loop()
+
+    # ------------------------------------------------------------------
+    def _publish_status(self, mode, vel_pitch, vel_yaw, ctrl):
+        # Published at STATUS_DECIMATION Hz-divided rate: building and sending
+        # a String at 1 kHz prevented the control timer from meeting its period.
+        # use <<ros2 topic echo /control --field data >> to see these logs
+        msg = String()
+        msg.data = (
+            f'\n\n[{mode}]'
+            f'\nOffset:     ({self.error[0]:.3f}, {self.error[1]:.3f}) px'
+            f'\nVelocity:   ({vel_pitch:.3f}, {vel_yaw:.3f}) rad/s'
+            f'\nParameters: (Kp:{ctrl.kp:.3f}, Ki:{ctrl.ki:.1f}, '
+            f'Kd:{ctrl.kd:.4f}, wo:{ctrl.omega_o:.1f})'
+        )
+        self.logger_info.publish(msg)
+
+    # ------------------------------------------------------------------
+    def stabilization_loop(self):
+        # Compute angular error between target and current orientation.
+        # The orientation topic is in degrees; the controllers work in radians.
+        error_pitch = math.radians(self.target_orientation[0] - self.current_orientation[0])
+        error_yaw   = math.radians(self.target_orientation[2] - self.current_orientation[2])
+
+        # Soft SS-PID controllers for smooth stabilization.
+        vel_yaw   = self.sspid_soft_yaw.compute(error_yaw)
+        vel_pitch = self.sspid_soft_pitch.compute(error_pitch)
+
+        vel_yaw   = min(MAX_VEL_STAB, max(-MAX_VEL_STAB, vel_yaw))
+        vel_pitch = min(MAX_VEL_STAB, max(-MAX_VEL_STAB, vel_pitch))
+        if self.observer_uses_saturated_input:
+            self.sspid_soft_yaw.set_applied_input(vel_yaw)
+            self.sspid_soft_pitch.set_applied_input(vel_pitch)
+
+        # Publish bounded angular velocities.
+        # Convention of /cam_vel: angular.x = pitch rate, angular.y = yaw rate.
+        msg = Twist()
+        msg.angular.x = vel_pitch
+        msg.angular.y = vel_yaw
+        self._send_command(msg)
+
+        # Log status periodically.
+        self._log_counter += 1
+        if self._log_counter % STATUS_DECIMATION == 0:
+            self.get_logger().info(
+                f'\n [STABILIZATION MODE]'
+                f'\n ---------------------------------------------------'
+                f'\n |      | Angle Error |   Velocity   | Current Pos.|'
+                f'\n ---------------------------------------------------'
+                f'\n |Yaw:  |  {error_yaw:.3f} rad  | {vel_yaw:.3f} rad/s |  {self.current_orientation[2]:.3f} deg  |'
+                f'\n |Pitch:|  {error_pitch:.3f} rad  | {vel_pitch:.3f} rad/s |  {self.current_orientation[0]:.3f} deg  |'
+                f'\n ---------------------------------------------------\n'
+            )
+            self._publish_status('STABILIZATION MODE', vel_pitch, vel_yaw, self.sspid_soft_pitch)
+
+    # ------------------------------------------------------------------
+    def control_loop(self):
+        # Convert pixel error to angular error.
+        yaw_error, pitch_error = self.pixel_to_angle(self.error[0], self.error[1])
+
+        # Classical PD (derivative updates on new target samples) with velocity saturation.
+        vel_yaw   = min(MAX_VEL_TRACK, max(-MAX_VEL_TRACK, self.sspid_yaw.compute(yaw_error, self.last_target_msg_mono)))
+        vel_pitch = min(MAX_VEL_TRACK, max(-MAX_VEL_TRACK, self.sspid_pitch.compute(pitch_error, self.last_target_msg_mono)))
+
+        if self.observer_uses_saturated_input:
+            self.sspid_yaw.set_applied_input(vel_yaw)
+            self.sspid_pitch.set_applied_input(vel_pitch)
+
+        # Publish bounded angular velocities.
+        msg = Twist()
+        # Gazebo sign calibration (confirmed by manual image-error tests):
+        # +dy => NEGATIVE physical pitch; +dx => NEGATIVE physical yaw.
+        # Negating after PD uses the same Gazebo-calibrated physical directions.
+        msg.angular.x = -vel_pitch
+        msg.angular.y = -vel_yaw
+        self._send_command(msg)
+
+        # Publish numerical log for the evaluator.
+        # NOTE: /pid_log is only published in tracking mode, so every metric
+        # derived from it is scoped to the samples in which a target was being
+        # tracked. See the "Data and Results" section of the README.
+        # Layout (indices 0-8 are unchanged with respect to earlier recordings,
+        # except 6/7 carry the raw measured angular-error derivative and 9/10
+        # the measured angular error; there are NO observer estimates here):
+        log_msg = Float64MultiArray()
+        log_msg.data = [
+            float(self.error[0]),                         # 0  Pixel error e_x [px]      Eq. (5)
+            float(self.error[1]),                         # 1  Pixel error e_y [px]      Eq. (5)
+            float(yaw_error),                             # 2  Angular error yaw [rad]   Eq. (6)
+            float(pitch_error),                           # 3  Angular error pitch [rad] Eq. (6)
+            float(vel_yaw),                               # 4  Controller output u_psi [rad/s]
+            float(vel_pitch),                             # 5  Controller output u_theta [rad/s]
+            float(self.sspid_yaw.x_hat[0]),               # 6  Measured d(yaw_error)/dt [rad/s]
+            float(self.sspid_pitch.x_hat[0]),             # 7  Measured d(pitch_error)/dt [rad/s]
+            float(self.error[2]),                         # 8  Target validity flag nu_t
+            float(self.sspid_yaw.x_hat[1]),               # 9  Measured yaw angular error [rad]
+            float(self.sspid_pitch.x_hat[1]),             # 10 Measured pitch angular error [rad]
+            float(math.hypot(self.error[0], self.error[1])),  # 11 Radial error e_p [px]
+        ]
+        if self.log_publisher.get_subscription_count() > 0:
+            self.log_publisher.publish(log_msg)
+
+        # Log status periodically.
+        self._log_counter += 1
+        if self._log_counter % STATUS_DECIMATION == 0:
+            self.get_logger().info(
+                f'\n[TRACKING MODE]'
+                f'\n   Offset:    ({self.error[0]:.3f}, {self.error[1]:.3f}) px'
+                f'\n   Velocity:  ({vel_pitch:.3f}, {vel_yaw:.3f}) rad/s'
+                f'\n   Parameters:(Kp:{self.sspid_yaw.kp:.3f}, Ki:{self.sspid_yaw.ki:.1f}, '
+                f'Kd:{self.sspid_yaw.kd:.4f}, wo:{self.sspid_yaw.omega_o:.1f})\n'
+            )
+            self._publish_status('TRACKING MODE', vel_pitch, vel_yaw, self.sspid_yaw)
+
+
+def main(args=None):
+    # Standard ROS 2 node startup. A finite run exits from its own timer,
+    # rather than via an external timeout that may kill the publisher.
+    rclpy.init(args=args)
+    node = GimbalControllerNode()
+    try:
+        while rclpy.ok() and not node.finished:
+            rclpy.spin_once(node, timeout_sec=0.05)
+    except KeyboardInterrupt:
+        node.get_logger().warn('Interrupted: requesting zero-velocity shutdown.')
+    finally:
+        # For a normal timed exit the timer already sent >=0.6 s of zero
+        # commands. On Ctrl+C, this is a best-effort additional stop; the
+        # independent adapter deadman remains the fallback on abrupt crashes.
+        if rclpy.ok() and node.enable_motion:
+            for _ in range(10):
+                try:
+                    node._publish_stop()
+                    time.sleep(0.02)
+                except Exception:
+                    break
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

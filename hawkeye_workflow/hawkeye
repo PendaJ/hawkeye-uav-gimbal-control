@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Hawkeye Gazebo / ROS 2 reproducible experiment entry point.
+set -eo pipefail
+# ROS setup scripts refer to optional unset variables; avoid nounset during sourcing.
+WS="${HAWKEYE_WS:-$HOME/hawkeye_x3_ws}"
+if [ ! -f /opt/ros/humble/setup.bash ]; then echo 'ROS 2 Humble not found' >&2; exit 1; fi
+if [ ! -f "$WS/install/setup.bash" ]; then echo "Workspace not built: $WS/install/setup.bash" >&2; exit 1; fi
+source /opt/ros/humble/setup.bash
+source "$WS/install/setup.bash"
+exec /usr/bin/python3 "$(dirname "$(readlink -f "$0")")/workflow.py" "$@"

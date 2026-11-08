@@ -1,0 +1,18 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>hawkeye_x3_gimbal</name>
+  <version>0.1.0</version>
+  <description>ROS 2 adapter and launch for Hawkeye X3 gimbal in Gazebo Harmonic</description>
+  <maintainer email="noreply@example.com">Hawkeye project</maintainer>
+  <license>BSD-3-Clause</license>
+  <buildtool_depend>ament_python</buildtool_depend>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>ros_gz_bridge</exec_depend>
+  <exec_depend>drone_ttc_sim</exec_depend>
+  <export><build_type>ament_python</build_type></export>
+</package>
