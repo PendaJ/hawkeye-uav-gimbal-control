@@ -1,0 +1,21 @@
+{
+  "duration_s": 15.0,
+  "initial_error_px": [
+    80.0,
+    28.0
+  ],
+  "method": "P90 of pilot raw metrics; rational J/(J+c)",
+  "metric_volatility": "mean absolute radial first difference (per valid vision sample)",
+  "model": "Gazebo X3 + YOLO26n + ByteTrack + Hawkeye SS-PD (device recorded in tracker.log)",
+  "pilot_folder": "/home/jay/hawkeye_x3_ws/rosbags/npso_pilot_20261105_053655",
+  "pilot_n": 10,
+  "pilot_seed": 2026,
+  "reference_constants": {
+    "acceleration": 0.48228276185957364,
+    "mae": 6.940780106408387,
+    "volatility": 0.6702261434023977,
+    "zero_crossings": 55.2
+  },
+  "repro": true,
+  "world_mode": "lateral"
+}
