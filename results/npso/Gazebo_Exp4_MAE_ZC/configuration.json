@@ -1,0 +1,27 @@
+{
+  "algorithm": "global-best-relative NPSO; persistent velocity; immediate gbest update",
+  "duration_s": 15.0,
+  "evaluations_budget": 220,
+  "normalizers": {
+    "acceleration": 0.48228276185957364,
+    "mae": 6.940780106408387,
+    "volatility": 0.6702261434023977,
+    "zero_crossings": 55.2
+  },
+  "particles": 20,
+  "pilot": "normalizers_lateral_15s.json",
+  "repro": true,
+  "rounds": 11,
+  "seed": 42,
+  "target_px": [
+    80.0,
+    28.0
+  ],
+  "weights": [
+    1.0,
+    0.0,
+    0.0,
+    1.0
+  ],
+  "world_mode": "lateral"
+}
