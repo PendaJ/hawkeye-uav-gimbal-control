@@ -1,0 +1,40 @@
+# ROS 2 / colcon
+**/build/
+**/install/
+**/log/
+.ros/
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+.pytest_cache/
+.mypy_cache/
+# Simulation / sensor recordings
+*.db3
+*.mcap
+*.bag
+*.bag.active
+*.mp4
+*.avi
+*.mov
+# Large model weights (review licensing before distributing)
+*.pt
+*.pth
+*.onnx
+*.engine
+*.ckpt
+# Temporary and editor files
+.DS_Store
+*.swp
+*.swo
+*~
+# Credentials
+*.pem
+*.key
+credentials.json
+secrets.json
+# Generated plots can be added deliberately with git add -f if appropriate
