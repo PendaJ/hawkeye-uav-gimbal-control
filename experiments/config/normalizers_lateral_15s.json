@@ -7,7 +7,7 @@
   "method": "P90 of pilot raw metrics; rational J/(J+c)",
   "metric_volatility": "mean absolute radial first difference (per valid vision sample)",
   "model": "Gazebo X3 + YOLO26n + ByteTrack + Hawkeye SS-PD (device recorded in tracker.log)",
-  "pilot_folder": "/home/jay/hawkeye_x3_ws/rosbags/npso_pilot_20261105_053655",
+  "pilot_folder": "npso_pilot_20261105_053655",
   "pilot_n": 10,
   "pilot_seed": 2026,
   "reference_constants": {
