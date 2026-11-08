@@ -1,0 +1,79 @@
+{
+  "controller": "custom",
+  "world": "lateral",
+  "duration_s": 15.0,
+  "seed": 42,
+  "initial_offset_px": [
+    80.0,
+    28.0
+  ],
+  "initial_offset_tolerance_px": 5.0,
+  "repro_method": "carrier reset + gimbal home + matched image error + phase trigger",
+  "carrier_trajectory": "y=0.35*sin(0.5*t) from first command; x=1,z=1.2 (combined adds yaw +/-5 and pitch +/-4 deg)",
+  "gains": {
+    "kp": 7.177391,
+    "kd": 0.061814,
+    "omega_o": 699.944368
+  },
+  "controller_sha256": "836ebd93396077ded3f3fcb0977172d477fe78c124725e54f91cf2d3c5757739",
+  "plugin_sha256": "c6ba1133f90af367630c40f1d0f694c9bf5cadfd853e529e542e0e08ede51d65",
+  "bag": "bag",
+  "run_directory": "lateral_custom_20261106_201517",
+  "success": true,
+  "carrier_reset_state": {
+    "mode": "lateral",
+    "triggered": true,
+    "epoch": 7,
+    "armed": false,
+    "active": false,
+    "sim_time": 242.753,
+    "start_sim_time": 221.195,
+    "elapsed": 0.0,
+    "y": 0.0
+  },
+  "initial_home_deg": {
+    "pitch_deg": 0.3507363418192442,
+    "yaw_deg": -0.3880528739671825
+  },
+  "initial_target_px": [
+    78.57574462890625,
+    23.833419799804688,
+    1.0
+  ],
+  "initial_gimbal_deg": {
+    "pitch": 14.025576894231387,
+    "yaw": 7.73022628893935
+  },
+  "pretrial_target_px": [
+    78.57257080078125,
+    23.819778442382812,
+    1.0
+  ],
+  "carrier_armed_state": {
+    "mode": "lateral",
+    "triggered": true,
+    "epoch": 7,
+    "armed": true,
+    "active": false,
+    "sim_time": 250.753,
+    "start_sim_time": 221.195,
+    "elapsed": 0.0,
+    "y": 0.0
+  },
+  "controller_process_start_ns": 1793992529676385213,
+  "controller_process_end_ns": 1793992546351787785,
+  "control_window_start_ns": 1793992530346659072,
+  "control_window_end_ns": 1793992545346659072,
+  "carrier_after_state": {
+    "mode": "lateral",
+    "triggered": true,
+    "epoch": 7,
+    "armed": false,
+    "active": true,
+    "sim_time": 266.003,
+    "start_sim_time": 251.389,
+    "elapsed": 14.614,
+    "y": 0.298934
+  },
+  "controller_returncode": 0
+}

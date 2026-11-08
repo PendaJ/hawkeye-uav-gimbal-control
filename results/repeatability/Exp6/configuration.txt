@@ -1,0 +1,11 @@
+Experiment: 6
+Purpose: Fixed-gain closed-loop repeatability
+Scenario: Gazebo lateral carrier motion
+Seed: 42
+Valid trials requested: 10
+Controller duration: 15 s
+Initial error target: (80, 28) px
+Position tolerance: 5 px
+Kp: 7.177391
+Kd: 0.061814
+Observer bandwidth: 699.944368
